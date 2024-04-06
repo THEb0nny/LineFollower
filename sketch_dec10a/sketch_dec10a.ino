@@ -6,11 +6,17 @@
 // https://github.com/GyverLibs/GyverPID
 // https://github.com/pololu/qtr-sensors-arduino
 
+#define PID_OPTIMIZED_I // Параметр для оптимизации суммы регулятора
+
 #include <QTRSensors.h>
+#include "GyverMotor2.h"
+#include "GyverPID.h"
 #include <TimerMs.h>
+#include <EncButton.h>
 
 #define DEBUG_LINE_SENSOR_RAW_VALUES true // Печать для дебага сырых значений с датчика линии при калибровки
 #define DEBUG_LINE_SENSOR_VALUES true // Печать нормализованных значений с сенсоров датчика линии
+#define PRINT_DT_ERR_U_DEBUG false // Печать информации о loopTime, error, u TRUE
 
 #define QTR_SEN_COUNT 8 // Количество сенсоров в датчике линии
 #define QTR_IR_PIN 12
@@ -25,12 +31,17 @@
 
 #define MAX_RANGE_VAl_LS 255 // Максимальное значенение диапазона для нормализации значений сенсоров датчика линии
 
+GMotor2<DRIVE3WIRE> leftMotor(7, 8, 9);
+GMotor2<DRIVE3WIRE> righMotor(5, 4, 3);
+
 QTRSensors qtr; // Создаём объект датчика линии
 TimerMs tmrPrint(10); // Объект таймера для печати инфы с сенсоров датчика линии в интервале
 
 byte qtr8aPins[QTR_SEN_COUNT] = {QTR_D1_PIN, QTR_D2_PIN, QTR_D3_PIN, QTR_D4_PIN, QTR_D5_PIN, QTR_D6_PIN, QTR_D7_PIN, QTR_D8_PIN};  // Массив пинов сенсоров датчика линии
 
 unsigned int qtrSensorValues[QTR_SEN_COUNT]; // Массив для хранения нормализованных значений с сенсоров датчика линии
+
+void(* softResetFunc) (void) = 0; // Функция мягкого перезапуска
 
 void setup() {
   Serial.begin(115200); // Устанавливаем скорость общения по Serial
@@ -59,19 +70,80 @@ void setup() {
       else Serial.println(String(qtr.calibrationOn.maximum[i]));
     }
   }
+  regulator.setDirection(REVERSE); // Направление регулирования (NORMAL/REVERSE)
+  regulator.setLimits(-200, 200); // Пределы регулятора
+  regulatorTmr.setPeriodMode(); // Настроем режим условия регулирования на период
+  motorLeft.reverse(1); // Реверс левого мотора
+  motorRight.reverse(0); // Реверс правого мотора
+  motorLeft.setMinDuty(10); // Мин ШИМ левого мотора
+  motorRight.setMinDuty(10); // Мин ШИМ правого мотора
+  regulatorTmr.setPeriodMode(); // Настроем режим условия регулирования на период
   Serial.println("Initial completed"); // Сообщение о конце инициализации
-  tmrPrint.setPeriodMode(); // Установить в режиме периода таймер печати
-  tmrPrint.start(); // Запускаем таймер печати в режиме интервала
+  while (millis() < 500); // Время после старта для возможности запуска, защита от перезагрузки и старта кода сразу
+  Serial.println("Ready... press btn");
+  while (true) { // Ждём нажатие кнопки для старта
+    btn.tick(); // Опрашиваем кнопку
+    if (btn.press()) { // Произошло нажатие
+      Serial.println("Go!!!");
+      break;
+    }
+  }
+  regulatorTmr.start(); // Запускаем таймер цикла регулирования
+  // Записываем время перед стартом loop
+  currTime = millis();
+  prevTime = currTime;
 }
 
 void loop() {
-  unsigned int position = qtr.readLineBlack(qtrSensorValues); // Прочитать значения с сенсоров датчика линии и получить позицию, записав их в qtrSensorValues
-  // qtr.read(qtrSensorValues); // Считать с датчика значения
-  if (DEBUG_LINE_SENSOR_VALUES && tmrPrint.tick()) {
-    for (byte i = 0; i < QTR_SEN_COUNT; i++) {
-      Serial.print(qtrSensorValues[i]);
-      Serial.print('\t');
+  CheckBtnClick(); // Вызываем функцию опроса кнопки
+
+  if (regulatorTmr.tick()) { // Раз в 10 мсек выполнять
+    currTime = millis();
+    loopTime = currTime - prevTime;
+    prevTime = currTime;
+    unsigned int position = qtr.readLineBlack(qtrSensorValues); // Прочитать значения с сенсоров датчика линии и получить позицию, записав их в qtrSensorValues
+    // qtr.read(qtrSensorValues); // Считать с датчика значения
+    CheckBtnClick(); // Вызываем функцию опроса кнопки
+
+    float error = 0;
+    regulator.setpoint = error; // Передаём ошибку
+    regulator.setDt(loopTime != 0 ? loopTime : 1); // Установка dt для регулятора
+    float u = regulator.getResult(); // Управляющее воздействие с регулятора
+
+    MotorsControl(u, 128); // Для управления моторами регулятором
+
+    if (DEBUG_LINE_SENSOR_VALUES && tmrPrint.tick()) {
+      for (byte i = 0; i < QTR_SEN_COUNT; i++) {
+        Serial.print(qtrSensorValues[i]);
+        Serial.print('\t');
+      }
+      Serial.println(position);
     }
-    Serial.println(position);
+
+    // Для отладки основной информации о регулировании
+    if (PRINT_DT_ERR_U_DEBUG) {
+      Serial.print("loopTime: " + String(loopTime) + "\t");
+      Serial.print("error: " + String(error) + "\t");
+      Serial.println("u: " + String(u));
+    }
+  }
+}
+
+// Управление двумя моторами
+void MotorsControl(int dir, int speed) {
+  int lMotorSpeed = speed + dir, rMotorSpeed = speed - dir;
+  float z = (float) speed / max(abs(lMotorSpeed), abs(rMotorSpeed)); // Вычисляем отношение желаемой мощности к наибольшей фактической
+  lMotorSpeed *= z, rMotorSpeed *= z;
+  motorLeft.setSpeed(lMotorSpeed);
+  motorRight.setSpeed(rMotorSpeed);
+}
+
+// Функция опроса о нажатии кнопки
+void CheckBtnClick() {
+  btn.tick(); // Опрашиваем кнопку в первый раз
+  if (btn.press()) { // Произошло нажатие
+    Serial.println("Btn press and reset");
+    delay(50); // Нужна задержка иначе не выведет сообщение
+    softResetFunc(); // Если клавиша нажата, то сделаем мягкую перезагрузку
   }
 }
