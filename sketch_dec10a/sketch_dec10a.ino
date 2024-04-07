@@ -15,8 +15,8 @@
 #include <EncButton.h>
 
 #define DEBUG_LINE_SENSOR_RAW_VALUES true // Печать для дебага сырых значений с датчика линии при калибровки
-#define DEBUG_LINE_SENSOR_VALUES true // Печать нормализованных значений с сенсоров датчика линии
-#define PRINT_DT_ERR_U_DEBUG false // Печать информации о loopTime, error, u TRUE
+#define DEBUG_LINE_SENSOR_VALUES false // Печать нормализованных значений с сенсоров датчика линии
+#define PRINT_DT_ERR_U_DEBUG true // Печать информации о loopTime, error, u TRUE
 
 #define QTR_SEN_COUNT 8 // Количество сенсоров в датчике линии
 #define QTR_IR_PIN 12
@@ -31,13 +31,23 @@
 
 #define MAX_RANGE_VAl_LS 255 // Максимальное значенение диапазона для нормализации значений сенсоров датчика линии
 
-GMotor2<DRIVE3WIRE> leftMotor(7, 8, 9);
-GMotor2<DRIVE3WIRE> righMotor(5, 4, 3);
+TimerMs tmrPrint(10); // Объект таймера для печати инфы с сенсоров датчика линии в интервале
+TimerMs regulatorTmr(10); // Инициализация объекта таймера цикла регулирования
 
 QTRSensors qtr; // Создаём объект датчика линии
-TimerMs tmrPrint(10); // Объект таймера для печати инфы с сенсоров датчика линии в интервале
+EncButton<EB_TICK, 2> btn; // Инициализация объекта простой кнопки
+GyverPID regulator(1, 0, 0, 10); // Инициализируем регулятор и устанавливаем коэффициенты регулятора
 
-byte qtr8aPins[QTR_SEN_COUNT] = {QTR_D1_PIN, QTR_D2_PIN, QTR_D3_PIN, QTR_D4_PIN, QTR_D5_PIN, QTR_D6_PIN, QTR_D7_PIN, QTR_D8_PIN};  // Массив пинов сенсоров датчика линии
+GMotor2<DRIVER3WIRE> leftMotor(6, 7, 11);
+GMotor2<DRIVER3WIRE> rightMotor(5, 4, 10);
+
+byte qtr8aPins[QTR_SEN_COUNT] = {QTR_D1_PIN, QTR_D2_PIN, QTR_D3_PIN, QTR_D4_PIN, QTR_D5_PIN, QTR_D6_PIN, QTR_D7_PIN, QTR_D8_PIN}; // Массив пинов сенсоров датчика линии
+
+int refRawWhite[QTR_SEN_COUNT] = {524, 398, 478, 579, 512, 247, 329, 296};
+int refRawBlack[QTR_SEN_COUNT] = {1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000};
+int refValue[QTR_SEN_COUNT] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+unsigned long currTime, prevTime, loopTime; // Время
 
 unsigned int qtrSensorValues[QTR_SEN_COUNT]; // Массив для хранения нормализованных значений с сенсоров датчика линии
 
@@ -54,7 +64,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT); // Установить режим пина встроенного светодиода
   digitalWrite(LED_BUILTIN, HIGH); // Включаем встроенный светодиод для сигнала начала калибровки
   Serial.println("Calibrate sensors start"); // Сообщение о конце калибровки
-  for (byte i = 0; i < 200; i++) {
+  for (byte i = 0; i < 50; i++) {
     qtr.calibrate();
   }
   digitalWrite(LED_BUILTIN, LOW); // Выключения встроенный светодиод для сигнала о завершении калибровки
@@ -70,14 +80,13 @@ void setup() {
       else Serial.println(String(qtr.calibrationOn.maximum[i]));
     }
   }
-  regulator.setDirection(REVERSE); // Направление регулирования (NORMAL/REVERSE)
-  regulator.setLimits(-200, 200); // Пределы регулятора
+  regulator.setDirection(NORMAL); // Направление регулирования (NORMAL/REVERSE)
+  regulator.setLimits(-255, 255); // Пределы регулятора
   regulatorTmr.setPeriodMode(); // Настроем режим условия регулирования на период
-  motorLeft.reverse(1); // Реверс левого мотора
-  motorRight.reverse(0); // Реверс правого мотора
-  motorLeft.setMinDuty(10); // Мин ШИМ левого мотора
-  motorRight.setMinDuty(10); // Мин ШИМ правого мотора
-  regulatorTmr.setPeriodMode(); // Настроем режим условия регулирования на период
+  leftMotor.reverse(1); // Реверс левого мотора
+  rightMotor.reverse(0); // Реверс правого мотора
+  leftMotor.setMinDuty(10); // Мин ШИМ левого мотора
+  rightMotor.setMinDuty(10); // Мин ШИМ правого мотора
   Serial.println("Initial completed"); // Сообщение о конце инициализации
   while (millis() < 500); // Время после старта для возможности запуска, защита от перезагрузки и старта кода сразу
   Serial.println("Ready... press btn");
@@ -88,6 +97,7 @@ void setup() {
       break;
     }
   }
+  tmrPrint.start();
   regulatorTmr.start(); // Запускаем таймер цикла регулирования
   // Записываем время перед стартом loop
   currTime = millis();
@@ -101,23 +111,37 @@ void loop() {
     currTime = millis();
     loopTime = currTime - prevTime;
     prevTime = currTime;
+
     unsigned int position = qtr.readLineBlack(qtrSensorValues); // Прочитать значения с сенсоров датчика линии и получить позицию, записав их в qtrSensorValues
     // qtr.read(qtrSensorValues); // Считать с датчика значения
     CheckBtnClick(); // Вызываем функцию опроса кнопки
 
-    float error = 0;
+    for (byte i = 0; i < QTR_SEN_COUNT; i++) {
+      refValue[i] = map(qtrSensorValues[i], refRawBlack[i], refRawWhite[i], 0, 255);
+      refValue[i] = constrain(refValue[i], 0, 255);
+      Serial.print(refValue[i]);
+      Serial.print('\t');
+    }
+
+    float error = (0.8 * refValue[7] + 0.4 * refValue[6] + 0.2 * refValue[5] +  1 * refValue[4]) - (refValue[3] * 1 + refValue[2] * 0.2 + refValue[1] * 0.5 + refValue[0] * 0.8);
     regulator.setpoint = error; // Передаём ошибку
     regulator.setDt(loopTime != 0 ? loopTime : 1); // Установка dt для регулятора
     float u = regulator.getResult(); // Управляющее воздействие с регулятора
 
-    MotorsControl(u, 128); // Для управления моторами регулятором
+    MotorsControl(u, 60); // Для управления моторами регулятором
 
     if (DEBUG_LINE_SENSOR_VALUES && tmrPrint.tick()) {
+      // for (byte i = 0; i < QTR_SEN_COUNT; i++) {
+      //   Serial.print(qtrSensorValues[i]);
+      //   Serial.print('\t');
+      // }
       for (byte i = 0; i < QTR_SEN_COUNT; i++) {
-        Serial.print(qtrSensorValues[i]);
+        refValue[i] = map(qtrSensorValues[i], refRawBlack[i], refRawWhite[i], 0, 255);
+        Serial.print(refValue[i]);
         Serial.print('\t');
       }
-      Serial.println(position);
+      //Serial.println(position);
+      Serial.println();
     }
 
     // Для отладки основной информации о регулировании
@@ -134,8 +158,8 @@ void MotorsControl(int dir, int speed) {
   int lMotorSpeed = speed + dir, rMotorSpeed = speed - dir;
   float z = (float) speed / max(abs(lMotorSpeed), abs(rMotorSpeed)); // Вычисляем отношение желаемой мощности к наибольшей фактической
   lMotorSpeed *= z, rMotorSpeed *= z;
-  motorLeft.setSpeed(lMotorSpeed);
-  motorRight.setSpeed(rMotorSpeed);
+  leftMotor.setSpeed(lMotorSpeed);
+  rightMotor.setSpeed(rMotorSpeed);
 }
 
 // Функция опроса о нажатии кнопки
