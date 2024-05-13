@@ -18,6 +18,8 @@
 #define DEBUG_LINE_SENSOR_VALUES false // Печать нормализованных значений с сенсоров датчика линии
 #define PRINT_DT_ERR_U_DEBUG true // Печать информации о loopTime, error, u TRUE
 
+#define CALIBRATION_BEFORE_START true // Калибровка перед стартом
+
 #define QTR_SEN_COUNT 8 // Количество сенсоров в датчике линии
 #define QTR_IR_PIN 12
 #define QTR_D1_PIN A0
@@ -63,18 +65,25 @@ void setup() {
   qtr.setEmitterPin(QTR_IR_PIN); // Подключаем IR подсветку
   pinMode(LED_BUILTIN, OUTPUT); // Установить режим пина встроенного светодиода
   digitalWrite(LED_BUILTIN, HIGH); // Включаем встроенный светодиод для сигнала начала калибровки
-  Serial.println("Calibrate sensors start"); // Сообщение о конце калибровки
-  for (byte i = 0; i < 50; i++) {
-    qtr.calibrate();
+  while (millis() < 500); // Время после старта для возможности запуска, защита от перезагрузки и старта кода сразу
+  if (CALIBRATION_BEFORE_START) {
+    Serial.println("Press btn to calibrate");
+    PauseUntilBtnPressed("Start calibrate"); // Ждём нажатие кнопки для старта калибровки
+    while (true) { // Пока не будет нажата кнопка
+      btn.tick(); // Опрашиваем кнопку
+      if (btn.press()) break; // Произошло нажатие
+      qtr.calibrate();
+    }
+    Serial.println("Calibrate done");
   }
   digitalWrite(LED_BUILTIN, LOW); // Выключения встроенный светодиод для сигнала о завершении калибровки
-  Serial.println("Calibrate done"); // Сообщение о конце калибровки
   if (DEBUG_LINE_SENSOR_RAW_VALUES) { // Печатать калибровочные данные белого и чёрного
+    Serial.print("Minimum: ");
     for (byte i = 0; i < QTR_SEN_COUNT; i++) { // Печатать минимальные значения при включенном эмиттере
       if (i < QTR_SEN_COUNT - 1) Serial.print(String(qtr.calibrationOn.minimum[i]) + " ");
-      else Serial.println(String(qtr.calibrationOn.maximum[i]));
+      else Serial.println(String(qtr.calibrationOn.minimum[i]));
     }
-    Serial.println();
+    Serial.print("Maximum: ");
     for (byte i = 0; i < QTR_SEN_COUNT; i++) { // Печатать максимальные значения при включенном эмиттере
       if (i < QTR_SEN_COUNT - 1) Serial.print(String(qtr.calibrationOn.maximum[i]) + " ");
       else Serial.println(String(qtr.calibrationOn.maximum[i]));
@@ -87,8 +96,6 @@ void setup() {
   rightMotor.reverse(0); // Реверс правого мотора
   leftMotor.setMinDuty(10); // Мин ШИМ левого мотора
   rightMotor.setMinDuty(10); // Мин ШИМ правого мотора
-  Serial.println("Initial completed"); // Сообщение о конце инициализации
-  while (millis() < 500); // Время после старта для возможности запуска, защита от перезагрузки и старта кода сразу
   Serial.println("Ready... press btn");
   while (true) { // Ждём нажатие кнопки для старта
     btn.tick(); // Опрашиваем кнопку
@@ -169,5 +176,15 @@ void CheckBtnClick() {
     Serial.println("Btn press and reset");
     delay(50); // Нужна задержка иначе не выведет сообщение
     softResetFunc(); // Если клавиша нажата, то сделаем мягкую перезагрузку
+  }
+}
+
+void PauseUntilBtnPressed(String str) {
+  while (true) { // Ждём нажатие кнопки для старта
+    btn.tick(); // Опрашиваем кнопку
+    if (btn.press()) { // Произошло нажатие
+      Serial.println(str);
+      break;
+    }
   }
 }
